@@ -14,7 +14,7 @@ from deepgram import DeepgramClient
 st.set_page_config(page_title="Pronunciation Checker (Deepgram)", page_icon="🎙️", layout="centered")
 
 STT_MODEL = "nova-3"                 # hardcoded
-TTS_VOICE_MODEL = "aura-2-thalia-en" # hardcoded voice for practice audio
+TTS_VOICE_MODEL = "aura-2-thalia-en" # hardcoded
 MAX_SECONDS = 60
 
 # ----------------------------
@@ -121,7 +121,6 @@ def render_highlighted_reference(ref_tokens: list[str], ref_marks: list[str]) ->
 def deepgram_transcribe(audio_bytes: bytes, language: str) -> str:
     api_key = get_deepgram_api_key()
     client = DeepgramClient(api_key=api_key)
-
     response = client.listen.v1.media.transcribe_file(
         request=audio_bytes,
         model=STT_MODEL,      # hardcoded nova-3
@@ -135,10 +134,9 @@ def deepgram_transcribe(audio_bytes: bytes, language: str) -> str:
 # Deepgram TTS (REST)
 # ----------------------------
 @st.cache_data(show_spinner=False)
-def deepgram_tts_audio(practice_text: str, voice_model: str = TTS_VOICE_MODEL) -> bytes:
+def deepgram_tts_audio(text: str, voice_model: str = TTS_VOICE_MODEL) -> bytes:
     """
-    Caches by input text + voice model, so repeated runs don't re-hit the API.
-    Returns audio bytes (typically mp3).
+    Cached by (text, voice_model). Returns WAV bytes for stable Streamlit playback.
     """
     api_key = get_deepgram_api_key()
     url = "https://api.deepgram.com/v1/speak"
@@ -146,50 +144,51 @@ def deepgram_tts_audio(practice_text: str, voice_model: str = TTS_VOICE_MODEL) -
         "Authorization": f"Token {api_key}",
         "Content-Type": "application/json",
     }
-    params = {"model": voice_model}
-    payload = {"text": practice_text}
+    params = {
+        "model": voice_model,
+        "container": "wav",
+        "encoding": "linear16",
+        "sample_rate": "16000",
+    }
+    payload = {"text": text}
 
     r = requests.post(url, headers=headers, params=params, json=payload, timeout=60)
     r.raise_for_status()
     return r.content
 
-def build_practice_script(mismatches: list[dict], max_items: int = 10) -> str:
+def practice_items_from_mismatches(mismatches: list[dict], max_items: int = 12) -> list[str]:
     """
-    Creates one short practice script so we only make ONE TTS call.
+    Pick unique 'expected' segments to practice.
     """
-    items = []
+    out = []
     seen = set()
-
     for m in mismatches:
-        # focus on what the user *should* say
         ref = (m.get("ref") or "").strip()
         if not ref or ref in {"(extra)"}:
             continue
+        ref = ref.replace("<num>", "number")  # better than speaking "<num>"
         if ref in seen:
             continue
         seen.add(ref)
-        items.append(ref)
-        if len(items) >= max_items:
+        out.append(ref)
+        if len(out) >= max_items:
             break
-
-    if not items:
-        return ""
-
-    joined = "; ".join(items)
-    return (
-        "Let's practice. Repeat each word or phrase clearly. "
-        f"{joined}. "
-        "Now repeat them one more time."
-    )
+    return out
 
 # ----------------------------
-# Session state (memory per run)
+# Session state: widget reset keys + last results
 # ----------------------------
-if "runs" not in st.session_state:
-    st.session_state.runs = []
+if "ref_key" not in st.session_state:
+    st.session_state.ref_key = 0
+if "audio_key" not in st.session_state:
+    st.session_state.audio_key = 0
+if "last" not in st.session_state:
+    st.session_state.last = None
 
 def clear_session():
-    st.session_state.runs = []
+    st.session_state.last = None
+    st.session_state.ref_key += 1
+    st.session_state.audio_key += 1
     st.cache_data.clear()
     st.rerun()
 
@@ -197,29 +196,34 @@ def clear_session():
 # UI
 # ----------------------------
 st.title("🎙️ Pronunciation Checker (Deepgram)")
-st.caption(
-    "Hardcoded STT model: **nova-3**. Paste the text you read, record up to 60s, then score based on unmatched words "
-    "(punctuation ignored, numbers normalized)."
-)
+st.caption("Model is locked to **nova-3**. Record ≤ 60s. Score is based on reference words matched (punctuation ignored, numbers normalized).")
 
-top_cols = st.columns([1, 1, 1])
-with top_cols[0]:
+top = st.columns([1, 1, 1])
+with top[0]:
     language = st.selectbox("Transcription dialect", ["en-GB", "en-US", "en"], index=0)
-with top_cols[1]:
+with top[1]:
     st.text_input("STT model (locked)", value=STT_MODEL, disabled=True)
-with top_cols[2]:
+with top[2]:
     if st.button("🧹 Clear / New session", use_container_width=True):
         clear_session()
 
-ref_text = st.text_area("Original text (paste what you read)", height=150, placeholder="Paste the passage you read...")
+ref_text = st.text_area(
+    "Original text (paste what you read)",
+    height=150,
+    placeholder="Paste the passage you read...",
+    key=f"ref_text_{st.session_state.ref_key}",
+)
 
-audio_file = st.audio_input("Record your voice (stop before 60 seconds)", sample_rate=16000)
+audio_file = st.audio_input(
+    "Record your voice (stop before 60 seconds)",
+    sample_rate=16000,
+    key=f"audio_{st.session_state.audio_key}",
+)
 
 audio_bytes = None
 if audio_file is not None:
     audio_bytes = audio_file.getvalue()
     st.audio(audio_bytes, format="audio/wav")
-
     dur = wav_duration_seconds(audio_bytes)
     if dur >= 0:
         st.info(f"Detected duration: **{dur:.1f}s** (target ≤ {MAX_SECONDS}s).")
@@ -238,7 +242,7 @@ if score_btn:
         st.error("Please record audio first.")
         st.stop()
 
-    with st.spinner("Transcribing with Deepgram (nova-3)…"):
+    with st.spinner("Transcribing (nova-3)…"):
         try:
             transcript = deepgram_transcribe(audio_bytes, language=language)
         except Exception as e:
@@ -246,63 +250,58 @@ if score_btn:
             st.stop()
 
     score, mismatches, ref_tokens, hyp_tokens, ref_marks = score_and_mismatches(ref_text, transcript)
-
-    # Store run in memory (session)
-    st.session_state.runs.append({
-        "language": language,
-        "transcript": transcript,
+    st.session_state.last = {
         "score": score,
         "mismatches": mismatches,
         "ref_tokens": ref_tokens,
         "ref_marks": ref_marks,
-    })
+    }
 
-    # Display latest run
-    st.subheader("Transcript")
-    st.write(transcript if transcript else "*(No transcript returned)*")
+# ---- Render results (if any)
+if st.session_state.last is not None:
+    score = st.session_state.last["score"]
+    mismatches = st.session_state.last["mismatches"]
+    ref_tokens = st.session_state.last["ref_tokens"]
+    ref_marks = st.session_state.last["ref_marks"]
 
-    st.subheader("Overall Score")
-    st.metric("Match score (based on reference words matched)", f"{score:.1f} / 100")
+    st.subheader("Pronunciation score")
+    st.metric("Pronunciation score", f"{score:.1f} / 100")
 
     st.subheader("Reference text with highlighted issues")
     st.markdown(render_highlighted_reference(ref_tokens, ref_marks), unsafe_allow_html=True)
 
     if mismatches:
-        st.subheader("Unmatched segments (what to practice)")
-        for m in mismatches[:50]:
-            label = m["type"].upper()
-            st.write(f"**{label}** — expected: `{m['ref']}` | heard: `{m['hyp']}`")
-        if len(mismatches) > 50:
-            st.caption(f"Showing first 50 mismatches (total: {len(mismatches)}).")
+        st.subheader("Practice audio (slow & clear)")
+        items = practice_items_from_mismatches(mismatches, max_items=12)
 
-        st.subheader("🔊 Practice audio (TTS)")
-        practice_script = build_practice_script(mismatches, max_items=10)
-        if practice_script:
-            st.write(practice_script)
+        # header row
+        h1, h2, h3 = st.columns([2, 1.5, 1.5])
+        h1.markdown("**Word / phrase**")
+        h2.markdown("**Repeat 1**")
+        h3.markdown("**Repeat 2**")
+
+        for phrase in items:
+            # Two separate audios (slight variation: second has longer pause)
+            t1 = f"{phrase}."
+            t2 = f"{phrase}..."
+
+            c1, c2, c3 = st.columns([2, 1.5, 1.5])
+            c1.write(phrase)
+
             try:
-                tts_bytes = deepgram_tts_audio(practice_script)
-                st.audio(tts_bytes, format="audio/mpeg")
-                st.caption(f"Voice: {TTS_VOICE_MODEL}")
+                a1 = deepgram_tts_audio(t1)
+                a2 = deepgram_tts_audio(t2)
+                c2.audio(a1, format="audio/wav")
+                c3.audio(a2, format="audio/wav")
             except Exception as e:
-                st.warning(f"TTS failed: {e}")
-        else:
-            st.info("No usable practice items found to synthesize.")
+                c2.warning(f"TTS failed: {e}")
+                c3.empty()
+
+        st.caption(f"Voice: {TTS_VOICE_MODEL}")
     else:
         st.success("Nice — no mismatches detected after normalization. 🎉")
 
-    # Session history
-    if st.session_state.runs:
-        st.divider()
-        st.subheader("Session history")
-        for i, run in enumerate(reversed(st.session_state.runs[-10:]), start=1):
-            with st.expander(f"Run #{len(st.session_state.runs) - i + 1} — {run['score']:.1f}/100 — {run['language']}"):
-                st.write(run["transcript"] or "*(No transcript returned)*")
-                if run["mismatches"]:
-                    st.caption(f"Mismatches: {len(run['mismatches'])}")
-                else:
-                    st.caption("No mismatches")
-
     st.caption(
         "Note: This is a pronunciation proxy using speech recognition matching. "
-        "It’s best for tracking improvement + spotting tricky words, not for judging accent ‘authenticity’."
+        "It’s best for tracking improvement + spotting tricky words."
     )
