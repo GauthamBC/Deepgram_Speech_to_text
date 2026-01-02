@@ -1,4 +1,8 @@
-<!doctype html>
+from flask import Flask, Response, request
+
+app = Flask(__name__)
+
+HTML = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -432,3 +436,36 @@
   </script>
 </body>
 </html>
+"""
+
+@app.get("/")
+def home():
+    return Response(HTML, mimetype="text/html")
+
+
+@app.post("/api/tts")
+def api_tts():
+    """
+    This is a placeholder endpoint so the UI can call /api/tts.
+    Replace this with your real TTS logic that returns audio bytes.
+
+    Expected request JSON:
+      { "text": "...", "model": "aura-2-draco-en" }
+
+    Must return: raw audio bytes with an audio/* mimetype.
+    """
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "")
+    model = data.get("model", "aura-2-draco-en")
+
+    # TODO: connect your real TTS here.
+    # For now, return 501 to indicate "not implemented".
+    return Response(
+        f"TTS not implemented yet. Received text={text!r}, model={model!r}",
+        status=501,
+        mimetype="text/plain",
+    )
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000, debug=True)
