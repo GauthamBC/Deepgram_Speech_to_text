@@ -16,7 +16,7 @@ st.set_page_config(page_title="Pronunciation Checker", page_icon="🎙️", layo
 
 STT_MODEL = "nova-3"                 # hardcoded
 STT_LANGUAGE = "en-GB"               # hardcoded (change to "en-US" or "en" if you want)
-TTS_VOICE_MODEL = "aura-2-thalia-en" # hardcoded
+TTS_VOICE_MODEL = "aura-2-draco-en"  # hardcoded
 MAX_SECONDS = 60
 
 # Practice settings
