@@ -5,29 +5,38 @@ import html
 import wave
 import requests
 from difflib import SequenceMatcher
+
 import streamlit as st
 from deepgram import DeepgramClient
 
 # ----------------------------
-# Config
+# Config (hardcoded)
 # ----------------------------
-st.set_page_config(page_title="Pronunciation Checker (Deepgram)", page_icon="🎙️", layout="centered")
+st.set_page_config(page_title="Pronunciation Checker", page_icon="🎙️", layout="centered")
 
 STT_MODEL = "nova-3"                 # hardcoded
+STT_LANGUAGE = "en-GB"               # hardcoded (change to "en-US" or "en" if you want)
 TTS_VOICE_MODEL = "aura-2-thalia-en" # hardcoded
 MAX_SECONDS = 60
+
+# Practice settings
+MAX_PRACTICE_ITEMS = 12
+SLOW_FACTOR = 0.75   # 0.75x speed (lower pitch too, but clearer for learners)
+FAST_FACTOR = 1.20   # 1.2x speed
+
 
 # ----------------------------
 # Helpers: auth
 # ----------------------------
-def get_deepgram_api_key() -> str:
+def get_api_key() -> str:
     api_key = os.getenv("DEEPGRAM_API_KEY") or st.secrets.get("DEEPGRAM_API_KEY", "")
     if not api_key:
         raise RuntimeError("Missing DEEPGRAM_API_KEY. Set it in Streamlit secrets or env var.")
     return api_key
 
+
 # ----------------------------
-# Helpers: audio duration
+# Helpers: WAV duration
 # ----------------------------
 def wav_duration_seconds(wav_bytes: bytes) -> float:
     try:
@@ -39,6 +48,7 @@ def wav_duration_seconds(wav_bytes: bytes) -> float:
             return frames / float(rate)
     except wave.Error:
         return -1.0
+
 
 # ----------------------------
 # Helpers: normalization/tokenization
@@ -61,6 +71,7 @@ def normalize_text_for_scoring(text: str) -> str:
 
 def tokenize(text: str) -> list[str]:
     return normalize_text_for_scoring(text).split()
+
 
 # ----------------------------
 # Alignment + highlighting
@@ -115,30 +126,33 @@ def render_highlighted_reference(ref_tokens: list[str], ref_marks: list[str]) ->
             )
     return " ".join(chunks)
 
+
 # ----------------------------
-# Deepgram STT (pre-recorded)
+# STT: transcription (pre-recorded)
 # ----------------------------
-def deepgram_transcribe(audio_bytes: bytes, language: str) -> str:
-    api_key = get_deepgram_api_key()
+def transcribe(audio_bytes: bytes) -> str:
+    api_key = get_api_key()
     client = DeepgramClient(api_key=api_key)
+
     response = client.listen.v1.media.transcribe_file(
         request=audio_bytes,
-        model=STT_MODEL,      # hardcoded nova-3
-        language=language,
+        model=STT_MODEL,
+        language=STT_LANGUAGE,
         smart_format=True,
         punctuate=True,
     )
     return response.results.channels[0].alternatives[0].transcript or ""
 
+
 # ----------------------------
-# Deepgram TTS (REST)
+# TTS: speak request -> WAV bytes
 # ----------------------------
 @st.cache_data(show_spinner=False)
-def deepgram_tts_audio(text: str, voice_model: str = TTS_VOICE_MODEL) -> bytes:
+def tts_wav_bytes(text: str, voice_model: str = TTS_VOICE_MODEL) -> bytes:
     """
-    Cached by (text, voice_model). Returns WAV bytes for stable Streamlit playback.
+    One TTS call per phrase. We return WAV linear16 @16k for easy speed variants.
     """
-    api_key = get_deepgram_api_key()
+    api_key = get_api_key()
     url = "https://api.deepgram.com/v1/speak"
     headers = {
         "Authorization": f"Token {api_key}",
@@ -156,17 +170,45 @@ def deepgram_tts_audio(text: str, voice_model: str = TTS_VOICE_MODEL) -> bytes:
     r.raise_for_status()
     return r.content
 
-def practice_items_from_mismatches(mismatches: list[dict], max_items: int = 12) -> list[str]:
-    """
-    Pick unique 'expected' segments to practice.
-    """
+
+# ----------------------------
+# Audio: create slow/fast variants by changing WAV playback rate
+# (simple & cheap; pitch changes slightly but clarity is good for learners)
+# ----------------------------
+def wav_change_playback_rate(wav_bytes: bytes, rate_multiplier: float) -> bytes:
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        nchannels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        framerate = wf.getframerate()
+        nframes = wf.getnframes()
+        frames = wf.readframes(nframes)
+
+    new_rate = max(8000, int(framerate * rate_multiplier))
+
+    out = io.BytesIO()
+    with wave.open(out, "wb") as ww:
+        ww.setnchannels(nchannels)
+        ww.setsampwidth(sampwidth)
+        ww.setframerate(new_rate)
+        ww.writeframes(frames)
+
+    return out.getvalue()
+
+
+# ----------------------------
+# Practice item selection
+# ----------------------------
+def practice_items_from_mismatches(mismatches: list[dict], max_items: int = MAX_PRACTICE_ITEMS) -> list[str]:
     out = []
     seen = set()
     for m in mismatches:
         ref = (m.get("ref") or "").strip()
         if not ref or ref in {"(extra)"}:
             continue
-        ref = ref.replace("<num>", "number")  # better than speaking "<num>"
+
+        # Make <num> pronounceable
+        ref = ref.replace("<num>", "number")
+
         if ref in seen:
             continue
         seen.add(ref)
@@ -175,8 +217,9 @@ def practice_items_from_mismatches(mismatches: list[dict], max_items: int = 12) 
             break
     return out
 
+
 # ----------------------------
-# Session state: widget reset keys + last results
+# Session state + "New session"
 # ----------------------------
 if "ref_key" not in st.session_state:
     st.session_state.ref_key = 0
@@ -185,27 +228,91 @@ if "audio_key" not in st.session_state:
 if "last" not in st.session_state:
     st.session_state.last = None
 
-def clear_session():
+def reset_session():
     st.session_state.last = None
     st.session_state.ref_key += 1
     st.session_state.audio_key += 1
     st.cache_data.clear()
-    st.rerun()
+
+def clear_query_params():
+    # Works across Streamlit versions
+    try:
+        st.query_params.clear()
+    except Exception:
+        st.experimental_set_query_params()
+
+def handle_new_session_param():
+    # If user clicks sticky "New session" link
+    try:
+        qp = st.query_params
+        val = qp.get("new_session")
+    except Exception:
+        qp = st.experimental_get_query_params()
+        val = qp.get("new_session", [None])[0]
+
+    if val == "1":
+        reset_session()
+        clear_query_params()
+        st.rerun()
+
+handle_new_session_param()
+
+
+# ----------------------------
+# Sticky top bar (always visible)
+# ----------------------------
+st.markdown(
+    """
+<style>
+div.block-container { padding-top: 4.25rem; }
+
+#sticky-topbar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 9999;
+  background: rgba(10, 12, 16, 0.92);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+
+#sticky-topbar .inner {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 0.75rem 1rem;
+  display: flex;
+  justify-content: flex-end;
+}
+
+#sticky-topbar a.ns-btn {
+  text-decoration: none;
+  font-weight: 600;
+  padding: 0.55rem 0.9rem;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,0.18);
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.92);
+}
+
+#sticky-topbar a.ns-btn:hover {
+  background: rgba(255,255,255,0.12);
+}
+</style>
+
+<div id="sticky-topbar">
+  <div class="inner">
+    <a class="ns-btn" href="?new_session=1">🆕 New session</a>
+  </div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
 
 # ----------------------------
 # UI
 # ----------------------------
-st.title("🎙️ Pronunciation Checker (Deepgram)")
-st.caption("Model is locked to **nova-3**. Record ≤ 60s. Score is based on reference words matched (punctuation ignored, numbers normalized).")
-
-top = st.columns([1, 1, 1])
-with top[0]:
-    language = st.selectbox("Transcription dialect", ["en-GB", "en-US", "en"], index=0)
-with top[1]:
-    st.text_input("STT model (locked)", value=STT_MODEL, disabled=True)
-with top[2]:
-    if st.button("🧹 Clear / New session", use_container_width=True):
-        clear_session()
+st.title("🎙️ Pronunciation Checker")
+st.caption("Record ≤ 60s. Score is based on reference words matched (punctuation ignored, numbers normalized).")
 
 ref_text = st.text_area(
     "Original text (paste what you read)",
@@ -224,6 +331,7 @@ audio_bytes = None
 if audio_file is not None:
     audio_bytes = audio_file.getvalue()
     st.audio(audio_bytes, format="audio/wav")
+
     dur = wav_duration_seconds(audio_bytes)
     if dur >= 0:
         st.info(f"Detected duration: **{dur:.1f}s** (target ≤ {MAX_SECONDS}s).")
@@ -242,11 +350,11 @@ if score_btn:
         st.error("Please record audio first.")
         st.stop()
 
-    with st.spinner("Transcribing (nova-3)…"):
+    with st.spinner("Analyzing…"):
         try:
-            transcript = deepgram_transcribe(audio_bytes, language=language)
+            transcript = transcribe(audio_bytes)
         except Exception as e:
-            st.error(f"Deepgram transcription failed: {e}")
+            st.error(f"Transcription failed: {e}")
             st.stop()
 
     score, mismatches, ref_tokens, hyp_tokens, ref_marks = score_and_mismatches(ref_text, transcript)
@@ -257,7 +365,7 @@ if score_btn:
         "ref_marks": ref_marks,
     }
 
-# ---- Render results (if any)
+# Render results (if any)
 if st.session_state.last is not None:
     score = st.session_state.last["score"]
     mismatches = st.session_state.last["mismatches"]
@@ -271,31 +379,34 @@ if st.session_state.last is not None:
     st.markdown(render_highlighted_reference(ref_tokens, ref_marks), unsafe_allow_html=True)
 
     if mismatches:
-        st.subheader("Practice audio (slow & clear)")
-        items = practice_items_from_mismatches(mismatches, max_items=12)
+        st.subheader("Practice audio (normal / slow / fast)")
+        items = practice_items_from_mismatches(mismatches, max_items=MAX_PRACTICE_ITEMS)
 
-        # header row
-        h1, h2, h3 = st.columns([2, 1.5, 1.5])
+        h1, h2, h3, h4 = st.columns([2.2, 1.4, 1.4, 1.4])
         h1.markdown("**Word / phrase**")
-        h2.markdown("**Repeat 1**")
-        h3.markdown("**Repeat 2**")
+        h2.markdown("**Normal**")
+        h3.markdown("**Slow**")
+        h4.markdown("**Fast**")
 
         for phrase in items:
-            # Two separate audios (slight variation: second has longer pause)
-            t1 = f"{phrase}."
-            t2 = f"{phrase}..."
-
-            c1, c2, c3 = st.columns([2, 1.5, 1.5])
-            c1.write(phrase)
-
+            # Generate ONE normal TTS WAV, then derive slow/fast locally
             try:
-                a1 = deepgram_tts_audio(t1)
-                a2 = deepgram_tts_audio(t2)
-                c2.audio(a1, format="audio/wav")
-                c3.audio(a2, format="audio/wav")
+                normal_wav = tts_wav_bytes(phrase)
+                slow_wav = wav_change_playback_rate(normal_wav, SLOW_FACTOR)
+                fast_wav = wav_change_playback_rate(normal_wav, FAST_FACTOR)
+
+                c1, c2, c3, c4 = st.columns([2.2, 1.4, 1.4, 1.4])
+                c1.write(phrase)
+                c2.audio(normal_wav, format="audio/wav")
+                c3.audio(slow_wav, format="audio/wav")
+                c4.audio(fast_wav, format="audio/wav")
+
             except Exception as e:
+                c1, c2, c3, c4 = st.columns([2.2, 1.4, 1.4, 1.4])
+                c1.write(phrase)
                 c2.warning(f"TTS failed: {e}")
                 c3.empty()
+                c4.empty()
 
         st.caption(f"Voice: {TTS_VOICE_MODEL}")
     else:
