@@ -408,7 +408,7 @@ if st.session_state.last is not None:
                 c3.empty()
                 c4.empty()
 
-        st.caption(f"Voice: {TTS_VOICE_MODEL}")
+        st.caption(f"Voice: British English")
     else:
         st.success("Nice — no mismatches detected after normalization. 🎉")
 
